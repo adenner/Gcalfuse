@@ -15,10 +15,20 @@ from .config import Config
 logger = logging.getLogger(__name__)
 
 
+class MountError(RuntimeError):
+    """Raised when a mount is refused for safety reasons (see _check_mountpoint)."""
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gcalfuse",
         description="Mount Google Calendar as a filesystem of .ics files.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Debug logging, including every FUSE operation.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -65,6 +75,32 @@ def _build_cache(config: Config):
     return cache, client
 
 
+def _is_gcalfuse_mount(mountpoint: Path) -> bool:
+    """Best-effort check for an existing gcalfuse mount at this path."""
+    try:
+        lines = Path("/proc/mounts").read_text().splitlines()
+    except OSError:
+        return False
+    target = str(mountpoint.resolve())
+    for line in lines:
+        fields = line.split()
+        if len(fields) >= 3 and fields[1] == target and "gcalfuse" in fields[0]:
+            return True
+    return False
+
+
+def _check_mountpoint(mountpoint: Path) -> None:
+    if not mountpoint.exists():
+        return
+    if _is_gcalfuse_mount(mountpoint):
+        raise MountError(f"{mountpoint} is already mounted by gcalfuse.")
+    if any(mountpoint.iterdir()):
+        raise MountError(
+            f"{mountpoint} is not empty. Refusing to mount over existing files; "
+            "pick an empty directory."
+        )
+
+
 def _cmd_mount(args: argparse.Namespace) -> int:
     import pyfuse3
     import trio
@@ -75,6 +111,7 @@ def _cmd_mount(args: argparse.Namespace) -> int:
     read_only = args.read_only or config.read_only
     mountpoint = Path(args.mountpoint).expanduser() if args.mountpoint else config.mountpoint
     mountpoint.mkdir(parents=True, exist_ok=True)
+    _check_mountpoint(mountpoint)
 
     cache, client = _build_cache(config)
     cache.refresh_full()
@@ -120,14 +157,14 @@ def _cmd_ls_days(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(
-        stream=sys.stderr,
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
     handlers = {
         "auth": _cmd_auth,
@@ -142,7 +179,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         return handler(args)
-    except auth.MissingCredentialsError as exc:
+    except (auth.MissingCredentialsError, MountError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 

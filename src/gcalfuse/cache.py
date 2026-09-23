@@ -206,8 +206,17 @@ class CalendarCache:
             while not self._stop_event.wait(self._poll_seconds):
                 try:
                     self.refresh_incremental()
-                except Exception:
-                    logger.exception("background refresh failed; keeping stale cache")
+                except Exception as exc:
+                    status = getattr(getattr(exc, "resp", None), "status", None)
+                    if status in (401, 403):
+                        logger.error(
+                            "Calendar API auth error (%s); token may be revoked or missing "
+                            "the calendar.events scope. Run `gcalfuse auth` again. "
+                            "Serving stale cache in the meantime.",
+                            status,
+                        )
+                    else:
+                        logger.exception("background refresh failed; keeping stale cache")
 
         self._thread = threading.Thread(target=_loop, daemon=True, name="gcalfuse-refresh")
         self._thread.start()

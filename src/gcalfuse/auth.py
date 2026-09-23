@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import stat
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -30,6 +32,13 @@ class MissingCredentialsError(RuntimeError):
     """Raised when credentials.json or a saved token is missing or unusable."""
 
 
+def _write_token(token_path, creds: Credentials) -> None:
+    """Persist a token and make sure it's never left world/group readable."""
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(creds.to_json())
+    os.chmod(token_path, stat.S_IRUSR | stat.S_IWUSR)
+
+
 def run_auth_flow(config: Config) -> Credentials:
     """Run the installed-app OAuth flow and persist the resulting token to disk."""
     if not config.credentials_path.exists():
@@ -38,8 +47,7 @@ def run_auth_flow(config: Config) -> Credentials:
     flow = InstalledAppFlow.from_client_secrets_file(str(config.credentials_path), SCOPES)
     creds = flow.run_local_server(port=0)
 
-    config.token_path.parent.mkdir(parents=True, exist_ok=True)
-    config.token_path.write_text(creds.to_json())
+    _write_token(config.token_path, creds)
     logger.info("saved OAuth token to %s", config.token_path)
     return creds
 
@@ -61,7 +69,7 @@ def load_credentials(config: Config) -> Credentials:
 
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
-        config.token_path.write_text(creds.to_json())
+        _write_token(config.token_path, creds)
         logger.info("refreshed OAuth token")
         return creds
 

@@ -20,15 +20,18 @@ for what currently works.
 - **Phase 1 (done):** pure path/ICS/cache logic, no FUSE, no network.
 - **Phase 2 (done):** auth, cache refresh, read-only FUSE mount.
 - **Phase 3 (done):** writes (create, edit, delete, rename) for non-recurring events.
-- **Phase 4:** hardening and full docs.
+- **Phase 4 (done):** hardening and full docs.
 
 ## What this is not
 
 - Not a blob-storage filesystem (calendar events stay small, structured
   meetings, not arbitrary files).
 - Not a CalDAV server, not multi-user, not multi-calendar in v1.
+- No Google Meet creation UI, no encryption of local data, no TUI/GUI.
 - Recurring event **instances** are read-only in v1: creating/editing/
-  deleting a single occurrence of a recurring series is rejected.
+  deleting a single occurrence of a recurring series is rejected. There's
+  no THISANDFOLLOWING or exception-event support.
+- Linux only (uses `pyfuse3`/`libfuse3`); no Windows/macOS support.
 
 ## Install (development)
 
@@ -51,16 +54,45 @@ libfuse3-dev`) since `pyfuse3` is a compiled extension against it.
 3. Create an OAuth client ID of type **Desktop app**.
 4. Download its JSON and save it to `~/.config/gcalfuse/credentials.json`.
 
-## Auth and mount
+## Config file reference
+
+Default path: `~/.config/gcalfuse/config.toml`. Every key is optional; shown
+values are the defaults.
+
+```toml
+calendar_id = "primary"           # one calendar in v1
+mountpoint = "~/Cal"
+timezone = "America/Chicago"      # IANA zone; folders/filenames use this
+window_past_days = 30             # cache window: how far back
+window_future_days = 90           # cache window: how far ahead
+poll_seconds = 60                 # background refresh interval
+read_only = false
+filename_style = "time_title"     # only style implemented in v1
+```
+
+Related fixed paths (not configurable, per the OAuth setup below):
+
+- OAuth client secret: `~/.config/gcalfuse/credentials.json` (you provide this)
+- OAuth token: `~/.config/gcalfuse/token.json` (written by `gcalfuse auth`,
+  and kept `chmod 600`)
+
+## Auth, mount, unmount
 
     gcalfuse auth
     gcalfuse mount ~/Cal          # or: gcalfuse mount --read-only ~/Cal
     ls ~/Cal/$(date +%Y/%m/%d)
     cat ~/Cal/$(date +%Y/%m/%d)/*.ics
-    fusermount -u ~/Cal
+    gcalfuse umount ~/Cal         # or: fusermount -u ~/Cal
 
 `gcalfuse ls-days` prints the cached dates and filenames without mounting,
 useful for debugging what's in the window.
+
+Pass `-v`/`--verbose` before the subcommand (e.g. `gcalfuse -v mount ~/Cal`)
+for debug-level logging, including a line for every FUSE operation.
+
+`gcalfuse mount` refuses to start (best effort) if the mountpoint already
+has files in it and isn't already a gcalfuse mount — this is a safety net
+against mounting over a directory you actually use for something else.
 
 ## Writes
 
@@ -113,3 +145,62 @@ Notes and v1 limitations:
 - Renaming within the same day changes only the title (`SUMMARY`, derived
   from the new filename); renaming to a different day reschedules the
   event, keeping its local clock time.
+
+## Editor quirks
+
+Most editors don't write files the naive way (`open`, `write`, `close`).
+`paths.py`'s `is_editor_junk()` recognizes the common temp-file patterns
+below and `fs.py` buffers them without ever calling the Google API, so
+these all work:
+
+- **vim**: writes a swap file (`.foo.ics.swp`) while editing, then on save
+  either writes-in-place or writes a new file and renames it over the
+  original. Both paths are handled; the swap file itself never commits.
+- **VS Code**: writes to a temp file in the same directory (matching
+  `*.tmp`) and renames it over the target on save.
+- **gedit / GNOME text editor**: uses GIO's atomic-save temp files, named
+  `.goutputstream-XXXXXX`.
+- **emacs**: lock files named `.#foo.ics` are ignored the same way.
+
+If your editor of choice uses a pattern not in this list, saves may
+silently create a permanently-pending, never-committed file (harmless,
+but the edit won't reach Google) — `paths.is_editor_junk()` is the one
+place to extend.
+
+## Permissions and fusermount
+
+- `gcalfuse mount` and `gcalfuse umount` shell out to `fusermount -u` to
+  unmount; there's no need for `sudo` as long as your user is allowed to
+  use FUSE (true by default on most desktop Linux distros; some minimal/
+  server distros require `user_allow_other` in `/etc/fuse.conf` or being
+  in a `fuse` group).
+- `chmod`/`chown` on files under the mount succeed as no-ops rather than
+  actually changing anything — this exists purely so editors that
+  defensively `chmod` a file before writing don't fail outright. Real
+  Google Calendar ACLs are unaffected by local file permissions.
+- The saved OAuth token (`~/.config/gcalfuse/token.json`) is written
+  `chmod 600` (owner read/write only) since it's a live credential.
+
+## Logging
+
+Logs go to stderr with a timestamp and level. Roughly:
+
+- `INFO`: mount/unmount, cache refresh counts, and every insert/patch/
+  delete with its Google event id.
+- `WARNING`: a rejected recurring-instance write/unlink, an ICS parse
+  failure on close, a Calendar API auth error (401/403) while serving a
+  stale cache.
+- `DEBUG` (behind `-v`): every FUSE operation (`getattr`, `lookup`,
+  `readdir`, `open`, `read`, `create`, `write`, `unlink`, `rename`,
+  `release`) with the path involved.
+
+## Robustness notes
+
+- Calendar API calls retry with exponential backoff on `429` (rate
+  limit) and `5xx` responses, up to 5 attempts.
+- If a background cache refresh fails for any reason (network blip, an
+  auth error, a rate limit that exhausted retries), the filesystem keeps
+  serving the last-known-good cache rather than going empty or crashing.
+- Event summaries are always slugified before becoming part of a
+  filename, so a summary containing `/` or other path-hostile characters
+  can never produce an invalid or escaping filename.

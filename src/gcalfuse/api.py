@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import UTC, date, datetime
 from typing import Protocol
 from zoneinfo import ZoneInfo
@@ -18,6 +19,32 @@ logger = logging.getLogger(__name__)
 API_SERVICE_NAME = "calendar"
 API_VERSION = "v3"
 PAGE_SIZE = 250
+
+# Retried status codes: 429 (rate limit) and 5xx (transient server errors).
+_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+_MAX_RETRIES = 5
+_BACKOFF_BASE_SECONDS = 1.0
+
+
+def _execute_with_backoff(request):
+    """Run a googleapiclient request, retrying 429/5xx with exponential backoff."""
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            return request.execute()
+        except HttpError as exc:
+            status = exc.resp.status if exc.resp is not None else None
+            if status not in _RETRYABLE_STATUSES or attempt == _MAX_RETRIES:
+                raise
+            delay = _BACKOFF_BASE_SECONDS * (2**attempt)
+            logger.warning(
+                "Calendar API returned %s, retrying in %.1fs (attempt %d/%d)",
+                status,
+                delay,
+                attempt + 1,
+                _MAX_RETRIES,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")  # loop always returns or raises
 
 
 class SyncTokenExpiredError(RuntimeError):
@@ -124,7 +151,7 @@ class CalendarClient:
             }
             if page_token:
                 params["pageToken"] = page_token
-            response = self._service.events().list(**params).execute()
+            response = _execute_with_backoff(self._service.events().list(**params))
             for raw in response.get("items", []):
                 if raw.get("status") != "cancelled":
                     records.append(map_event(raw, self._tz))
@@ -154,7 +181,7 @@ class CalendarClient:
                 }
                 if page_token:
                     params["pageToken"] = page_token
-                response = self._service.events().list(**params).execute()
+                response = _execute_with_backoff(self._service.events().list(**params))
                 for raw in response.get("items", []):
                     if raw.get("status") == "cancelled":
                         deleted.append(raw["id"])
@@ -172,10 +199,8 @@ class CalendarClient:
 
     def get(self, event_id: str) -> EventRecord | None:
         try:
-            raw = (
-                self._service.events()
-                .get(calendarId=self._calendar_id, eventId=event_id)
-                .execute()
+            raw = _execute_with_backoff(
+                self._service.events().get(calendarId=self._calendar_id, eventId=event_id)
             )
         except HttpError as exc:
             if exc.resp is not None and exc.resp.status == 404:
@@ -186,19 +211,21 @@ class CalendarClient:
         return map_event(raw, self._tz)
 
     def insert(self, body: dict) -> EventRecord:
-        raw = self._service.events().insert(calendarId=self._calendar_id, body=body).execute()
+        raw = _execute_with_backoff(
+            self._service.events().insert(calendarId=self._calendar_id, body=body)
+        )
         logger.info("inserted event %s", raw["id"])
         return map_event(raw, self._tz)
 
     def patch(self, event_id: str, body: dict) -> EventRecord:
-        raw = (
-            self._service.events()
-            .patch(calendarId=self._calendar_id, eventId=event_id, body=body)
-            .execute()
+        raw = _execute_with_backoff(
+            self._service.events().patch(calendarId=self._calendar_id, eventId=event_id, body=body)
         )
         logger.info("patched event %s", event_id)
         return map_event(raw, self._tz)
 
     def delete(self, event_id: str) -> None:
-        self._service.events().delete(calendarId=self._calendar_id, eventId=event_id).execute()
+        _execute_with_backoff(
+            self._service.events().delete(calendarId=self._calendar_id, eventId=event_id)
+        )
         logger.info("deleted event %s", event_id)

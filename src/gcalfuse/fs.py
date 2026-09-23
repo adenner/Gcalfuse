@@ -246,6 +246,7 @@ class GcalfuseFS(pyfuse3.Operations):
 
     async def getattr(self, inode, ctx=None):
         path = self._path_for_inode(inode)
+        logger.debug("getattr %s", path)
         pending = self._pending.get(path)
         if pending is not None:
             return self._pending_attrs(inode, pending)
@@ -255,6 +256,7 @@ class GcalfuseFS(pyfuse3.Operations):
     async def lookup(self, parent_inode, name, ctx=None):
         parent_path = self._path_for_inode(parent_inode)
         child_path = parent_path / os.fsdecode(name)
+        logger.debug("lookup %s", child_path)
         pending = self._pending.get(child_path)
         inode = self._inode_for_path(child_path)
         if pending is not None:
@@ -271,6 +273,7 @@ class GcalfuseFS(pyfuse3.Operations):
 
     async def readdir(self, fh, start_id, token):
         path = self._path_for_inode(fh)
+        logger.debug("readdir %s (start_id=%d)", path, start_id)
         children = self._children(path)
         for i, (name, kind, record) in enumerate(children):
             if i < start_id:
@@ -286,6 +289,7 @@ class GcalfuseFS(pyfuse3.Operations):
 
     async def open(self, inode, flags, ctx=None):
         path = self._path_for_inode(inode)
+        logger.debug("open %s (flags=%s)", path, oct(flags))
         pending = self._pending.get(path)
         if pending is not None:
             return pyfuse3.FileInfo(fh=inode)
@@ -307,6 +311,7 @@ class GcalfuseFS(pyfuse3.Operations):
 
     async def read(self, fh, off, size):
         path = self._path_for_inode(fh)
+        logger.debug("read %s (off=%d, size=%d)", path, off, size)
         pending = self._pending.get(path)
         if pending is not None:
             return bytes(pending.buffer[off : off + size])
@@ -317,6 +322,7 @@ class GcalfuseFS(pyfuse3.Operations):
 
     async def release(self, fh):
         path = self._inode_to_path.get(fh)
+        logger.debug("release %s", path)
         if path is not None:
             await self._commit_pending(path)
 
@@ -330,6 +336,7 @@ class GcalfuseFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EROFS)
         parent_path = self._path_for_inode(parent_inode)
         child_path = parent_path / os.fsdecode(name)
+        logger.debug("create %s", child_path)
 
         existing = self._index.get_by_path(child_path)
         if existing is not None and existing.is_recurring_instance:
@@ -380,6 +387,7 @@ class GcalfuseFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EROFS)
         parent_path = self._path_for_inode(parent_inode)
         path = parent_path / os.fsdecode(name)
+        logger.debug("unlink %s", path)
 
         pending = self._pending.get(path)
         if pending is not None and pending.event_id is None:
@@ -406,6 +414,7 @@ class GcalfuseFS(pyfuse3.Operations):
 
         old_path = self._path_for_inode(parent_inode_old) / os.fsdecode(name_old)
         new_path = self._path_for_inode(parent_inode_new) / os.fsdecode(name_new)
+        logger.debug("rename %s -> %s", old_path, new_path)
 
         pending = self._pending.pop(old_path, None)
         if pending is not None:

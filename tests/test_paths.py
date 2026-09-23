@@ -58,6 +58,13 @@ def test_slugify_length_cap():
     assert len(result) <= 60
 
 
+def test_slugify_strips_slash_and_nul():
+    result = slugify("Meeting/Room \x00 Booking")
+    assert "/" not in result
+    assert "\x00" not in result
+    assert result == "meeting_room_booking"
+
+
 def test_collision_suffix_distinct_names():
     base = PurePosixPath("/2026/09/23/0900-0930_standup.ics")
     p1 = with_collision_suffix(base, "eventid1abcdef")

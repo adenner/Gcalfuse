@@ -259,3 +259,21 @@ def test_rename_to_junk_name_does_not_delete_google_event():
     trio.run(scenario)
     assert client.delete_calls == []
     assert client.patch_calls == []
+
+
+def test_closing_an_editor_junk_named_file_makes_zero_api_calls():
+    fs, client = build_fs()
+
+    async def scenario():
+        target_day = day_inode(fs, "2026", "09", "24")
+        for junk_name in (b".foo.ics.swp", b"foo.ics.tmp", b".#foo.ics", b"foo.ics~"):
+            file_info, _attr = await fs.create(
+                target_day, junk_name, 0o644, os.O_CREAT | os.O_WRONLY
+            )
+            await fs.write(file_info.fh, 0, SIMPLE_ICS)
+            await fs.release(file_info.fh)
+
+    trio.run(scenario)
+    assert client.insert_calls == []
+    assert client.patch_calls == []
+    assert client.delete_calls == []
