@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gcalfuse"
+version = "0.1.0"
+description = "A FUSE filesystem that exposes Google Calendar events as files in a year/month/day tree."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "BSD-2-Clause" }
+dependencies = [
+    "pyfuse3>=3.3.0",
+    "google-api-python-client>=2.100.0",
+    "google-auth-oauthlib>=1.2.0",
+    "google-auth>=2.23.0",
+    "icalendar>=5.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+gcalfuse = "gcalfuse.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
