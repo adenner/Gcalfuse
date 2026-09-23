@@ -71,16 +71,35 @@ def test_children_of_file_path_is_enotdir():
 # -- lookup / getattr --------------------------------------------------------
 
 
-def test_lookup_missing_entries_raise_enoent():
+def test_lookup_of_invalid_or_missing_names_is_enoent():
     fs, _ = build_fs(THREE_EVENTS)
 
     async def scenario():
-        await expect_errno(errno.ENOENT, fs.lookup(pyfuse3.ROOT_INODE, b"2099"))
         await expect_errno(errno.ENOENT, fs.lookup(pyfuse3.ROOT_INODE, b".git"))
-        month = await lookup_path(fs, "2026", "09")
-        await expect_errno(errno.ENOENT, fs.lookup(month.st_ino, b"25"))  # no events that day
+        await expect_errno(errno.ENOENT, fs.lookup(pyfuse3.ROOT_INODE, b"notes.txt"))
+        year = await lookup_path(fs, "2026")
+        await expect_errno(errno.ENOENT, fs.lookup(year.st_ino, b"13"))
+        await expect_errno(errno.ENOENT, fs.lookup(year.st_ino, b"9"))
+        day = await lookup_path(fs, "2026", "09", "23")
+        await expect_errno(errno.ENOENT, fs.lookup(day.st_ino, b"nope.ics"))
+        feb = await lookup_path(fs, "2026", "02")
+        await expect_errno(errno.ENOENT, fs.lookup(feb.st_ino, b"30"))
 
     trio.run(scenario)
+
+
+def test_every_valid_date_resolves_but_only_populated_ones_are_listed():
+    """So `cat > 2026/09/30/x.ics` and `mv x 2026/09/30/` work on an empty day."""
+    fs, _ = build_fs(THREE_EVENTS)
+
+    async def scenario():
+        empty_day = await lookup_path(fs, "2027", "01", "15")
+        return stat.S_ISDIR(empty_day.st_mode)
+
+    assert trio.run(scenario)
+    assert names(fs, "/") == ["2026"]
+    assert names(fs, "/2026/09") == ["23", "24"]
+    assert names(fs, "/2027/01/15") == []
 
 
 def test_failed_lookup_does_not_allocate_an_inode():
@@ -88,7 +107,7 @@ def test_failed_lookup_does_not_allocate_an_inode():
     before = len(fs._inode_to_path)
 
     async def scenario():
-        for name in (b".git", b"HEAD", b"desktop.ini", b"2099"):
+        for name in (b".git", b"HEAD", b"desktop.ini", b"autorun.inf"):
             await expect_errno(errno.ENOENT, fs.lookup(pyfuse3.ROOT_INODE, name))
 
     trio.run(scenario)

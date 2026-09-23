@@ -4,16 +4,17 @@ Read path (getattr, lookup, readdir, open, read) is served entirely from the
 in-memory EventIndex and never touches the network.
 
 Write path: writes are buffered in memory per path (a PendingWrite) and sent
-to Google once, when the file is released or when a rename lands a buffered
-file on a real event name. See docs/DEVELOPMENT.md for the full state
-machine; the short version:
+to Google once, when the file is closed (flush) or when a rename lands a
+buffered file on a real event name. See docs/DEVELOPMENT.md for the full
+state machine; the short version:
 
 - A name that is not a real event name (editor swap/backup/temp files) never
   causes a Google call. Its content just sits in memory.
 - Renaming a committed event to such a name "parks" it (Google untouched).
-  If a new file is then created at the event's old name — vim's default
-  save strategy — it adopts the parked event's id, so the save becomes a
-  patch rather than a duplicate insert.
+  If a new file is then created at the event's old name (vim's default save
+  strategy), it adopts the parked event's id, so the save becomes a patch
+  rather than a duplicate insert. If that save is rejected, the event is
+  parked again so the editor's recovery can't delete it.
 - Every handler converts unexpected exceptions to EIO, because pyfuse3
   tears down the whole mount on any exception that isn't a FUSEError.
 """
@@ -79,6 +80,10 @@ class PendingWrite:
     parked:      the committed record this entry was renamed away from, when
                  an event was renamed onto a junk name. Lets us restore it
                  locally, or let a new file at `parked_from` adopt its id.
+    adopted_from: for a file that adopted a parked event, the backup entry it
+                 took the event from. If the save fails, the event is parked
+                 on that backup again so the editor's recovery (delete the new
+                 file, rename the backup back) can't delete it in Google.
     """
 
     event_id: str | None
@@ -86,6 +91,7 @@ class PendingWrite:
     dirty: bool = False
     parked: EventRecord | None = None
     parked_from: PurePosixPath | None = None
+    adopted_from: PendingWrite | None = field(default=None, repr=False)
 
 
 def _fuse_op(fn):
@@ -247,16 +253,12 @@ class GcalfuseFS(pyfuse3.Operations):
         except InvalidPathError as exc:
             raise pyfuse3.FUSEError(errno.ENOENT) from exc
 
-        if isinstance(parsed, YearDir):
-            if parsed.year in self._index.years():
-                return "dir", None
-        elif isinstance(parsed, MonthDir):
-            if parsed.month in self._index.months(parsed.year):
-                return "dir", None
-        elif isinstance(parsed, DayDir):
-            if parsed.day in self._index.days(parsed.year, parsed.month):
-                return "dir", None
-        elif isinstance(parsed, EventFile):
+        if isinstance(parsed, YearDir | MonthDir | DayDir):
+            # Every valid date resolves, even with no events, so you can
+            # `cat >` or `mv` an event onto an empty day. Listings (readdir)
+            # still show only populated years/months/days.
+            return "dir", None
+        if isinstance(parsed, EventFile):
             record = self._record_at(path)
             if record is not None:
                 return "file", record
@@ -488,37 +490,46 @@ class GcalfuseFS(pyfuse3.Operations):
 
         existing = self._record_at(child_path)
         self._reject_recurring(existing)
-        if existing is not None:
-            event_id = existing.event_id
-        else:
-            event_id = self._adopt_parked(child_path)
-
         # dirty=True: a newly created real-named file commits even with no
         # writes (`touch 2026/09/24/lunch.ics` creates a default event).
-        pending = PendingWrite(event_id=event_id, dirty=True)
+        pending = PendingWrite(event_id=existing.event_id if existing else None, dirty=True)
+        if existing is None:
+            self._adopt_parked(child_path, pending)
         self._pending[child_path] = pending
         inode = self._inode_for_path(child_path)
         return pyfuse3.FileInfo(fh=inode, keep_cache=False), self._pending_attrs(inode, pending)
 
-    def _adopt_parked(self, path: PurePosixPath) -> str | None:
-        """If an event was parked (renamed to a junk name) from `path`, claim its id.
+    def _adopt_parked(self, path: PurePosixPath, pending: PendingWrite) -> None:
+        """If an event was parked (renamed to a junk name) from `path`, give it to `pending`.
 
         This is vim's default save: rename foo.ics -> foo.ics~, write a new
         foo.ics, delete foo.ics~. Without adoption that would insert a
         duplicate event.
         """
-        for parked in self._pending.values():
-            if parked.parked is not None and parked.parked_from == path:
-                record = parked.parked
+        for backup in self._pending.values():
+            if backup.parked is not None and backup.parked_from == path:
+                record = backup.parked
                 self._reject_recurring(record)
-                # Back in the index, so a rejected save leaves the original
-                # event visible (and its duration known) instead of vanishing.
+                # Back in the index so its duration is known when the save
+                # builds a patch body.
                 self._index.add(record)
-                parked.parked = None
-                parked.parked_from = None
-                parked.event_id = None  # the backup is now plain scratch
-                return record.event_id
-        return None
+                backup.parked = None
+                backup.parked_from = None
+                backup.event_id = None  # the backup is now plain scratch
+                pending.event_id = record.event_id
+                pending.adopted_from = backup
+                return
+
+    def _repark(self, pending: PendingWrite, path: PurePosixPath) -> None:
+        """Undo an adoption after a failed save: the event goes back on the backup."""
+        backup = pending.adopted_from
+        record = self._index.get(pending.event_id) if pending.event_id else None
+        if record is None or not any(p is backup for p in self._pending.values()):
+            return
+        backup.parked = record
+        backup.parked_from = path
+        backup.event_id = record.event_id
+        self._index.remove(record.event_id)
 
     @_fuse_op
     async def write(self, fh, off, buf):
@@ -627,7 +638,7 @@ class GcalfuseFS(pyfuse3.Operations):
             pending.event_id = target.event_id
             pending.dirty = True
         elif pending.event_id is None and is_committable_name(new_path.name):
-            pending.event_id = self._adopt_parked(new_path)
+            self._adopt_parked(new_path, pending)
 
         del self._pending[old_path]
         self._pending[new_path] = pending
@@ -732,6 +743,11 @@ class GcalfuseFS(pyfuse3.Operations):
             body = self._build_body(pending, parsed, existing)
             if pending.event_id is None:
                 record = await self._call_api(self._client.insert, body)
+            elif existing is not None and body == self._body_for(existing):
+                # Saved unchanged (`:w` with no edits, an editor restoring its
+                # backup after a failed save): nothing to send.
+                logger.debug("unchanged save of %s; no API call", path)
+                record = existing
             else:
                 record = await self._call_api(self._client.patch, pending.event_id, body)
         except pyfuse3.FUSEError as exc:
@@ -739,13 +755,19 @@ class GcalfuseFS(pyfuse3.Operations):
             # content (or nothing, for a failed create). Google is untouched
             # unless the failure came from Google itself.
             self._pending.pop(path, None)
-            if exc.errno == errno.ENOENT and pending.event_id:
+            if pending.adopted_from is not None:
+                self._repark(pending, path)
+            elif exc.errno == errno.ENOENT and pending.event_id:
                 self._index.remove(pending.event_id)  # deleted remotely
             raise
 
         self._index.add(record)
         self._pending.pop(path, None)
         self._alias_if_renamed(path, record.event_id)
+
+    def _body_for(self, record: EventRecord) -> dict:
+        """The patch body that saving `record`'s own rendering would produce."""
+        return ics_to_event_patch(event_to_ics(record), default_tz=self._tz)
 
     def _build_body(
         self, pending: PendingWrite, parsed: EventFile, existing: EventRecord | None

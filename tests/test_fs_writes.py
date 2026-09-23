@@ -469,10 +469,11 @@ def test_unlink_non_recurring_calls_delete_once():
     async def scenario():
         day = await lookup_path(fs, "2026", "09", "23")
         await fs.unlink(day.st_ino, b"0900-0930_standup.ics")
-        await expect_errno(errno.ENOENT, fs.lookup(pyfuse3.ROOT_INODE, b"2026"))
+        await expect_errno(errno.ENOENT, fs.lookup(day.st_ino, b"0900-0930_standup.ics"))
 
     trio.run(scenario)
     assert client.delete_calls == ["e1"]
+    assert fs._children(fs._path_for_inode(pyfuse3.ROOT_INODE)) == []  # no empty year listed
 
 
 def test_unlink_recurring_instance_is_eperm_with_no_delete():
@@ -927,3 +928,37 @@ def test_rejected_vim_style_save_leaves_original_event_in_place():
 
     assert b"SUMMARY:Standup" in trio.run(scenario)
     assert client.patch_calls == client.insert_calls == client.delete_calls == []
+
+
+def test_vim_recovery_after_rejected_save_never_deletes_the_event():
+    """Exact sequence traced from real vim (backupcopy=auto) when a save fails:
+    rename foo -> foo~, create foo, write, close fails, unlink foo, rename foo~ -> foo."""
+    fs, client = build_fs([make_event("e1", "Standup", day=23)])
+
+    async def scenario():
+        day = (await lookup_path(fs, "2026", "09", "23")).st_ino
+        name = b"0900-0930_standup.ics"
+        await fs.rename(day, name, day, name + b"~", 0)
+        info, _ = await fs.create(day, name, 0o644, CREATE)
+        await fs.write(info.fh, 0, b"oops\n")
+        await expect_errno(errno.EIO, fs.flush(info.fh))
+        await fs.release(info.fh)
+        await expect_errno(errno.ENOENT, fs.unlink(day, name))
+        await fs.rename(day, name + b"~", day, name, 0)
+        return await read_file(fs, "2026", "09", "23", "0900-0930_standup.ics")
+
+    assert b"SUMMARY:Standup" in trio.run(scenario)
+    assert client.delete_calls == client.patch_calls == client.insert_calls == []
+    assert fs._pending == {}
+
+
+def test_saving_unchanged_content_makes_no_api_call():
+    fs, client = build_fs([make_event("e1", "Standup", day=23, description="agenda")])
+
+    async def scenario():
+        original = await read_file(fs, "2026", "09", "23", "0900-0930_standup.ics")
+        await overwrite(fs, "2026", "09", "23", "0900-0930_standup.ics", data=original)
+        return await read_file(fs, "2026", "09", "23", "0900-0930_standup.ics")
+
+    assert b"SUMMARY:Standup" in trio.run(scenario)
+    assert client.patch_calls == []

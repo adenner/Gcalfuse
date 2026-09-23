@@ -205,15 +205,32 @@ def test_recurring_instance_rejects_write_and_rm(mount):
 
 def test_mkdir_is_refused(mount):
     with pytest.raises(PermissionError):
-        (mount.root / "2026" / "09" / "30").mkdir()
+        (mount.root / "2026" / "09" / "notes").mkdir()
+
+
+def test_create_and_move_onto_a_day_with_no_events(mount):
+    empty = mount.root / "2026" / "09" / "30"
+    assert "30" not in os.listdir(mount.root / "2026" / "09")
+    assert os.listdir(empty) == []
+    subprocess.run(["mv", str(mount.today / "1400-1500_1_on_1.ics"), str(empty)], check=True)
+    assert os.listdir(empty) == ["1400-1500_1_on_1.ics"]
+    assert "30" in os.listdir(mount.root / "2026" / "09")
+    (mount.root / "2026" / "10" / "02" / "retro.ics").write_text("")
+    assert mount.ops() == ["patch", "insert"]
+    assert sorted(os.listdir(mount.root / "2026")) == ["09", "10"]
 
 
 # -- real editors --------------------------------------------------------------
 
 
-def vim(path: Path, *commands: str) -> subprocess.CompletedProcess:
-    """Run real vim non-interactively with default settings (swap + backup on)."""
-    args = ["vim", "-Es", "-u", "NONE", "-i", "NONE"]
+def vim(path: Path, *commands: str, backupcopy: str = "auto") -> subprocess.CompletedProcess:
+    """Run real vim non-interactively with its normal (nocompatible) save behavior.
+
+    backupskip is cleared because its default skips backups under /tmp, which
+    is where pytest's tmp_path lives; we want the real backup/rename dance.
+    """
+    args = ["vim", "-N", "-Es", "-u", "NONE", "-i", "NONE"]
+    args += ["-c", f"set backupcopy={backupcopy} writebackup backupskip="]
     for command in commands:
         args += ["-c", command]
     return subprocess.run(
@@ -225,21 +242,22 @@ needs_vim = pytest.mark.skipif(not shutil.which("vim"), reason="vim not installe
 
 
 @needs_vim
-def test_vim_edit_is_a_single_patch(mount):
+@pytest.mark.parametrize(
+    "backupcopy",
+    [
+        "yes",  # copy to foo~, overwrite foo in place
+        "no",  # rename foo -> foo~, write a new foo
+        "auto",  # probe with a "4913" file, then rename like "no"
+    ],
+)
+def test_vim_edit_is_a_single_patch_for_every_backup_strategy(mount, backupcopy):
     path = mount.today / "0900-0930_standup.ics"
-    assert vim(path, "%s/SUMMARY:Standup/SUMMARY:Standup!/", "wq").returncode == 0
+    result = vim(path, "%s/SUMMARY:Standup/SUMMARY:Team Standup/", "wq", backupcopy=backupcopy)
+    assert result.returncode == 0, result.stderr
     assert mount.ops() == ["patch"], mount.calls()
-    assert mount.calls()[0]["body"]["summary"] == "Standup!"
-    # No swap, backup, or probe files left behind.
-    assert sorted(os.listdir(mount.today)) == ["0900-0930_standup.ics", "1400-1500_1_on_1.ics"]
-
-
-@needs_vim
-def test_vim_edit_that_changes_the_title_renames_the_file(mount):
-    path = mount.today / "0900-0930_standup.ics"
-    assert vim(path, "%s/SUMMARY:Standup/SUMMARY:Team Standup/", "wq").returncode == 0
-    assert mount.ops() == ["patch"], mount.calls()
-    assert "0900-0930_team_standup.ics" in os.listdir(mount.today)
+    assert mount.calls()[0]["body"]["summary"] == "Team Standup"
+    # Renamed to the new title; no swap, backup or probe files left behind.
+    assert sorted(os.listdir(mount.today)) == ["0900-0930_team_standup.ics", "1400-1500_1_on_1.ics"]
 
 
 @needs_vim
@@ -260,12 +278,15 @@ def test_vim_writing_a_new_file_is_a_single_insert(mount):
 
 
 @needs_vim
-def test_vim_is_told_when_a_save_is_rejected(mount):
-    """The EIO must reach the editor at close(), not be swallowed after it."""
-    result = vim(mount.today / "0900-0930_standup.ics", "%d", "call setline(1, 'oops')", "wq")
+@pytest.mark.parametrize("backupcopy", ["yes", "no", "auto"])
+def test_vim_is_told_when_a_save_is_rejected_and_nothing_is_lost(mount, backupcopy):
+    """The EIO must reach vim at close(), and vim's recovery must not delete anything."""
+    path = mount.today / "0900-0930_standup.ics"
+    result = vim(path, "%d", "call setline(1, 'oops')", "wq", backupcopy=backupcopy)
     assert result.returncode != 0
-    assert mount.ops() == []
-    assert "SUMMARY:Standup" in (mount.today / "0900-0930_standup.ics").read_text()
+    assert mount.ops() == [], mount.calls()
+    assert "SUMMARY:Standup" in path.read_text()
+    assert sorted(os.listdir(mount.today)) == ["0900-0930_standup.ics", "1400-1500_1_on_1.ics"]
 
 
 def test_sed_in_place_is_a_single_patch(mount):
