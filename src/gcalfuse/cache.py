@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -17,6 +18,11 @@ if TYPE_CHECKING:
     from .api import CalendarClientProtocol
 
 logger = logging.getLogger(__name__)
+
+# Incremental (syncToken) refreshes only report *changed* events, so they
+# never pull in old events as the window slides forward or evict ones that
+# slid out of it. A periodic full refetch fixes both.
+FULL_REFRESH_SECONDS = 3600
 
 
 @dataclass
@@ -78,6 +84,19 @@ class EventIndex:
         with self._lock:
             return self._id_to_path.get(event_id)
 
+    def apply(self, upserts: Iterable[EventRecord], removals: Iterable[str]) -> None:
+        """Add/replace and remove many records with a single path rebuild.
+
+        Rebuilding is O(n) and holds the lock that FUSE reads wait on, so a
+        sync delta must not rebuild once per changed event.
+        """
+        with self._lock:
+            for event_id in removals:
+                self._by_id.pop(event_id, None)
+            for record in upserts:
+                self._by_id[record.event_id] = record
+            self._rebuild_paths()
+
     def replace_all(self, records: Iterable[EventRecord]) -> None:
         """Replace the whole cache contents, e.g. after a full window refetch."""
         with self._lock:
@@ -90,9 +109,7 @@ class EventIndex:
 
     def months(self, year: int) -> list[int]:
         with self._lock:
-            return sorted(
-                {int(p.parts[2]) for p in self._path_to_id if int(p.parts[1]) == year}
-            )
+            return sorted({int(p.parts[2]) for p in self._path_to_id if int(p.parts[1]) == year})
 
     def days(self, year: int, month: int) -> list[int]:
         with self._lock:
@@ -109,9 +126,7 @@ class EventIndex:
             return sorted(
                 p.parts[4]
                 for p in self._path_to_id
-                if int(p.parts[1]) == year
-                and int(p.parts[2]) == month
-                and int(p.parts[3]) == day
+                if int(p.parts[1]) == year and int(p.parts[2]) == month and int(p.parts[3]) == day
             )
 
     def _rebuild_paths(self) -> None:
@@ -152,6 +167,7 @@ class CalendarCache:
         self._poll_seconds = poll_seconds
         self.index = EventIndex(tz)
         self._sync_token: str | None = None
+        self._last_full_refresh: float | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -168,12 +184,22 @@ class CalendarCache:
         records, sync_token = self._client.list_window(time_min, time_max)
         self.index.replace_all(records)
         self._sync_token = sync_token
+        self._last_full_refresh = time.monotonic()
         logger.info("full refresh: %d events in window", len(records))
 
     def refresh_incremental(self) -> None:
-        """Apply a syncToken-based delta if available, else fall back to a full refetch."""
+        """Apply a syncToken-based delta if possible, else do a full window refetch.
+
+        Falls back to a full refetch when there's no sync token, the client
+        doesn't support deltas, the token expired, or FULL_REFRESH_SECONDS
+        have passed since the last full refetch.
+        """
         list_updates = getattr(self._client, "list_updates", None)
-        if self._sync_token is None or list_updates is None:
+        full_is_due = (
+            self._last_full_refresh is None
+            or time.monotonic() - self._last_full_refresh >= FULL_REFRESH_SECONDS
+        )
+        if self._sync_token is None or list_updates is None or full_is_due:
             self.refresh_full()
             return
 
@@ -187,36 +213,43 @@ class CalendarCache:
             return
 
         time_min, time_max = self._window()
-        for event_id in deleted:
-            self.index.remove(event_id)
+        in_window: list[EventRecord] = []
+        removals = list(deleted)
         for record in records:
-            record_end = record.end or record.start
-            if record.start <= time_max and record_end >= time_min:
-                self.index.add(record)
+            if record.start <= time_max and (record.end or record.start) >= time_min:
+                in_window.append(record)
             else:
-                self.index.remove(record.event_id)
+                removals.append(record.event_id)  # moved outside the window
+        self.index.apply(in_window, removals)
 
         self._sync_token = next_token or self._sync_token
-        logger.info(
-            "incremental refresh: %d updated, %d deleted", len(records), len(deleted)
-        )
+        logger.info("incremental refresh: %d updated, %d deleted", len(records), len(deleted))
+
+    def refresh_once(self) -> bool:
+        """One background refresh tick. Never raises; keeps the stale cache on failure.
+
+        Returns True if the refresh succeeded.
+        """
+        try:
+            self.refresh_incremental()
+            return True
+        except Exception as exc:
+            status = getattr(exc, "status", None)
+            if status in (401, 403):
+                logger.error(
+                    "Calendar API auth error (%s); the token may be revoked or missing "
+                    "the calendar.events scope. Run `gcalfuse auth` again. "
+                    "Serving the stale cache in the meantime.",
+                    status,
+                )
+            else:
+                logger.exception("background refresh failed; keeping stale cache")
+            return False
 
     def start_background_refresh(self) -> None:
         def _loop() -> None:
             while not self._stop_event.wait(self._poll_seconds):
-                try:
-                    self.refresh_incremental()
-                except Exception as exc:
-                    status = getattr(getattr(exc, "resp", None), "status", None)
-                    if status in (401, 403):
-                        logger.error(
-                            "Calendar API auth error (%s); token may be revoked or missing "
-                            "the calendar.events scope. Run `gcalfuse auth` again. "
-                            "Serving stale cache in the meantime.",
-                            status,
-                        )
-                    else:
-                        logger.exception("background refresh failed; keeping stale cache")
+                self.refresh_once()
 
         self._thread = threading.Thread(target=_loop, daemon=True, name="gcalfuse-refresh")
         self._thread.start()

@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 license = { text = "BSD-2-Clause" }
 dependencies = [
     "pyfuse3>=3.3.0",
+    "trio>=0.22",
     "google-api-python-client>=2.100.0",
     "google-auth-oauthlib>=1.2.0",
     "google-auth>=2.23.0",
@@ -38,3 +39,6 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "fuse: mounts a real FUSE filesystem (auto-skipped when /dev/fuse is unavailable)",
+]

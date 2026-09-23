@@ -6,6 +6,7 @@ Pure functions only: no cache, no network, no FUSE.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, replace
 from datetime import date, datetime, tzinfo
 from pathlib import PurePosixPath
@@ -16,11 +17,14 @@ if TYPE_CHECKING:
 
 # Editor junk filenames we should never treat as a real event commit.
 _JUNK_PATTERNS = [
-    re.compile(r"^\..*\.swp$"),  # vim swap
+    re.compile(r"^\..*\.sw[a-p]$"),  # vim swap (.swp, then .swo, .swn, ...)
     re.compile(r"^\.#.*$"),  # emacs lock file
-    re.compile(r"^.*~$"),  # backup files
+    re.compile(r"^#.*#$"),  # emacs auto-save
+    re.compile(r"^.*~$"),  # backup files (vim, emacs, gedit)
     re.compile(r"^.*\.tmp$"),  # generic temp files
-    re.compile(r"^\.goutputstream-.*$"),  # gedit/gio temp files
+    re.compile(r"^\.goutputstream-.*$"),  # GIO atomic-save temp (gedit, GNOME apps)
+    re.compile(r"^.*\.kate-swp$"),  # kate/kwrite swap
+    re.compile(r"^.*___jb_(?:tmp|old)___$"),  # JetBrains "safe write"
 ]
 
 _SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
@@ -80,10 +84,15 @@ ParsedPath = RootDir | YearDir | MonthDir | DayDir | EventFile
 
 
 def slugify(summary: str) -> str:
-    """Lowercase, replace non-alnum runs with `_`, squeeze, cap at 60 chars."""
+    """Lowercase, replace non-alnum runs with `_`, squeeze, cap at 60 chars.
+
+    Accented Latin letters are folded to ASCII first ("Café" -> "cafe") so
+    they don't vanish; scripts with no ASCII equivalent still become "_".
+    """
     if not summary:
         return "untitled"
-    lowered = summary.lower()
+    folded = unicodedata.normalize("NFKD", summary).encode("ascii", "ignore").decode("ascii")
+    lowered = folded.lower()
     replaced = _SLUG_STRIP_RE.sub("_", lowered)
     squeezed = _SLUG_SQUEEZE_RE.sub("_", replaced).strip("_")
     if not squeezed:

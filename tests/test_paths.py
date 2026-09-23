@@ -166,3 +166,65 @@ def test_editor_junk_detected():
 
 def test_editor_junk_not_flagged_for_real_file():
     assert not is_editor_junk("0900-0930_standup.ics")
+
+
+def test_slugify_folds_accents_to_ascii():
+    assert slugify("Café Zürich Offsite") == "cafe_zurich_offsite"
+
+
+def test_slugify_non_latin_script_becomes_untitled():
+    assert slugify("会議") == "untitled"
+
+
+def test_slugify_truncation_does_not_leave_trailing_underscore():
+    result = slugify("a" * 59 + " b")
+    assert len(result) <= 60 and not result.endswith("_")
+
+
+def test_parse_path_accepts_pure_posix_path_and_trailing_slash():
+    assert parse_path(PurePosixPath("/2026/09/23")) == DayDir(2026, 9, 23)
+    assert parse_path("/2026/09/23/") == DayDir(2026, 9, 23)
+
+
+def test_parse_path_rejects_relative_paths():
+    with pytest.raises(InvalidPathError):
+        parse_path("2026/09/23")
+
+
+def test_parse_path_accepts_leap_day_only_in_leap_years():
+    assert parse_path("/2028/02/29") == DayDir(2028, 2, 29)
+    with pytest.raises(InvalidPathError):
+        parse_path("/2026/02/29")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".foo.ics.swo",  # second vim swap file
+        "#foo.ics#",  # emacs auto-save
+        ".foo.ics.kate-swp",
+        "foo.ics___jb_tmp___",
+        "foo.ics___jb_old___",
+    ],
+)
+def test_more_editor_scratch_names_are_junk(name):
+    assert is_editor_junk(name)
+
+
+@pytest.mark.parametrize("name", ["0900-0930_swp.ics", "tmp_meeting.ics", "0000_pto.ics"])
+def test_real_names_containing_junk_words_are_not_junk(name):
+    assert not is_editor_junk(name)
+
+
+def test_path_for_uses_configured_zone_for_filename_times():
+    utc = ZoneInfo("UTC")
+    event = FakeEvent(
+        "x",
+        "Call",
+        datetime(2026, 9, 23, 14, 0, tzinfo=utc),
+        end=datetime(2026, 9, 23, 15, 0, tzinfo=utc),
+    )
+    assert path_for(event, CHICAGO).name == "0900-1000_call.ics"
+    assert path_for(event, ZoneInfo("Asia/Tokyo")) == PurePosixPath(
+        "/2026/09/23/2300-0000_call.ics"
+    )
