@@ -59,9 +59,10 @@ def _build_cache(config: Config):
     tz = ZoneInfo(config.timezone)
     creds = auth.load_credentials(config)
     client = CalendarClient(creds, config.calendar_id, tz)
-    return CalendarCache(
+    cache = CalendarCache(
         client, tz, config.window_past_days, config.window_future_days, config.poll_seconds
     )
+    return cache, client
 
 
 def _cmd_mount(args: argparse.Namespace) -> int:
@@ -75,11 +76,11 @@ def _cmd_mount(args: argparse.Namespace) -> int:
     mountpoint = Path(args.mountpoint).expanduser() if args.mountpoint else config.mountpoint
     mountpoint.mkdir(parents=True, exist_ok=True)
 
-    cache = _build_cache(config)
+    cache, client = _build_cache(config)
     cache.refresh_full()
     cache.start_background_refresh()
 
-    fs_ops = GcalfuseFS(cache.index, read_only=read_only)
+    fs_ops = GcalfuseFS(cache.index, client, read_only=read_only)
     fuse_options = set(pyfuse3.default_options)
     fuse_options.add("fsname=gcalfuse")
     if read_only:
@@ -106,7 +107,7 @@ def _cmd_umount(args: argparse.Namespace) -> int:
 
 def _cmd_ls_days(args: argparse.Namespace) -> int:
     config = Config.load()
-    cache = _build_cache(config)
+    cache, _client = _build_cache(config)
     cache.refresh_full()
     index = cache.index
     for year in index.years():

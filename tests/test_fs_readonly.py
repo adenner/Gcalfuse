@@ -34,7 +34,7 @@ def build_fs(records, read_only=True):
         client, CHICAGO, window_past_days=30, window_future_days=90, poll_seconds=60
     )
     cache.refresh_full()
-    return GcalfuseFS(cache.index, read_only=read_only), client
+    return GcalfuseFS(cache.index, client, read_only=read_only), client
 
 
 THREE_EVENTS = [

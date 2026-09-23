@@ -49,7 +49,7 @@ class EventIndex:
     """
 
     def __init__(self, tz: ZoneInfo) -> None:
-        self._tz = tz
+        self.tz = tz
         self._lock = threading.RLock()
         self._by_id: dict[str, EventRecord] = {}
         self._path_to_id: dict[PurePosixPath, str] = {}
@@ -118,7 +118,7 @@ class EventIndex:
         """Caller must hold self._lock."""
         groups: dict[PurePosixPath, list[EventRecord]] = {}
         for record in self._by_id.values():
-            base_path = pathsmod.path_for(record, self._tz)
+            base_path = pathsmod.path_for(record, self.tz)
             groups.setdefault(base_path, []).append(record)
 
         path_to_id: dict[PurePosixPath, str] = {}
